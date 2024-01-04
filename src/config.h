@@ -8,8 +8,8 @@
 #define DEBUG
 //ESP32 PINS TO CONTROL LAN8720
 #define ETH_CLK_MODE_1 ETH_CLOCK_GPIO17_OUT
-#define ETH_POWER_PIN_ALTERNATIVE_1 5
-#define ETH_POWER_PIN_1 -1
+#define ETH_POWER_PIN_ALTERNATIVE_1 -1
+#define ETH_POWER_PIN_1 12
 #define ETH_TYPE_1 ETH_PHY_LAN8720
 #define ETH_ADDR_1 0
 #define ETH_MDC_PIN_1 23
@@ -19,7 +19,7 @@
 #define CC2652P_FLSH 32
 #define CC2652P_RXD 36
 #define CC2652P_TXD 4
-#define BTN 35
+#define BTN 34
 #define MODE_SWITCH 33
 #define DEBOUNCE_TIME 70
 #define PRODUCTION 1
@@ -28,7 +28,7 @@
 
 const int16_t overseerInterval = 10 * 1000; //check lan or wifi connection every 5sec
 const uint8_t overseerMaxRetry = 3; //5x12 = 60sec delay for AP start
-const uint8_t LED_RED = 12;
+const uint8_t LED_RED = 13;
 const uint8_t LED_BLUE = 14;
 const uint8_t MAX_SOCKET_CLIENTS = 5;
 
