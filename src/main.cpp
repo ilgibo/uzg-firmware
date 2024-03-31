@@ -1,20 +1,27 @@
 #include <WiFi.h>
-#include <WiFiClient.h>
+// #include <WiFiClient.h>
+// #include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
-#include "FS.h"
+#include <FS.h>
 #include <LittleFS.h>
+#include <Update.h>
+#include <Ticker.h>
+#include <esp_wifi.h>
+#include <ETH.h>
+#include <ESPmDNS.h>
+#include <DNSServer.h>
+#include <CCTools.h>
+#include <WireGuard-ESP32.h>
+#include <CronAlarms.h>
+
 #include "config.h"
 #include "web.h"
 #include "log.h"
 #include "etc.h"
-#include <Update.h>
+#include "mqtt.h"
+#include "zb.h"
 #include "version.h"
-#include "Ticker.h"
-#include <esp_wifi.h>
-#include <ETH.h>
-#include "ESPmDNS.h"
-#include <DNSServer.h>
 
 #ifdef ETH_CLK_MODE
 #undef ETH_CLK_MODE
@@ -23,172 +30,237 @@
 #define BUFFER_SIZE 256
 
 ConfigSettingsStruct ConfigSettings;
-InfosStruct Infos;
+zbVerStruct zbVer;
+// InfosStruct Infos;
+MqttSettingsStruct MqttSettings;
+WgSettingsStruct WgSettings;
 
-//volatile bool btnFlag = false;
+// volatile bool btnFlag = false;
 int btnFlag = false;
 bool updWeb = false;
 
-const char* coordMode = "coordMode"; //coordMode node name
-const char* prevCoordMode = "prevCoordMode"; //prevCoordMode node name
-const char* configFileSystem = "/config/system.json";
-const char* configFileWifi = "/config/configWifi.json";
-const char* configFileEther = "/config/configEther.json";
-const char* configFileGeneral = "/config/configGeneral.json";
-const char* configFileSecurity = "/config/configSecurity.json";
-const char* configFileSerial = "/config/configSerial.json";
-const char* deviceModel = "UZG-01";
-
 void mDNS_start();
 void connectWifi();
-void handlelongBtn();
-void handletmrNetworkOverseer();
+void handleLongBtn();
+void handleTmrNetworkOverseer();
 void setupCoordinatorMode();
 void startAP(const bool start);
 IPAddress parse_ip_address(const char *str);
 
-Ticker tmrBtnLongPress(handlelongBtn, 1000, 0, MILLIS);
-Ticker tmrNetworkOverseer(handletmrNetworkOverseer, overseerInterval, 0, MILLIS);
+Ticker tmrBtnLongPress(handleLongBtn, 1000, 0, MILLIS);
+Ticker tmrNetworkOverseer(handleTmrNetworkOverseer, overseerInterval, 0, MILLIS);
 
 IPAddress apIP(192, 168, 1, 1);
 DNSServer dnsServer;
 WiFiServer server(TCP_LISTEN_PORT, MAX_SOCKET_CLIENTS);
-//MDNSResponder MDNS;
 
-void initLan(){
-  if ( ETH.begin(ETH_ADDR_1, ETH_POWER_PIN_1, ETH_MDC_PIN_1, ETH_MDIO_PIN_1, ETH_TYPE_1, ETH_CLK_MODE_1, ETH_POWER_PIN_ALTERNATIVE_1)){
-      DEBUG_PRINTLN(F("LAN start ok"));
-      if (!ConfigSettings.dhcp){
-        DEBUG_PRINTLN(F("ETH STATIC"));
-        ETH.config(parse_ip_address(ConfigSettings.ipAddress), parse_ip_address(ConfigSettings.ipGW), parse_ip_address(ConfigSettings.ipMask));
-        //ConfigSettings.disconnectEthTime = millis();
-      }else{
-        DEBUG_PRINTLN(F("ETH DHCP"));
-      }
-    }else{
-      DEBUG_PRINTLN(F("LAN start err"));
-      //esp_eth_stop();
+static WireGuard wg;
+
+extern CCTools CCTool;
+// MDNSResponder MDNS; don't need?
+
+void initLan()
+{
+  if (ETH.begin(ETH_ADDR_1, ETH_POWER_PIN_1, ETH_MDC_PIN_1, ETH_MDIO_PIN_1, ETH_TYPE_1, ETH_CLK_MODE_1, ETH_POWER_PIN_ALTERNATIVE_1))
+  {
+    DEBUG_PRINTLN(F("LAN start ok"));
+    if (!ConfigSettings.dhcp)
+    {
+      DEBUG_PRINTLN(F("ETH STATIC"));
+      ETH.config(parse_ip_address(ConfigSettings.ipAddress), parse_ip_address(ConfigSettings.ipGW), parse_ip_address(ConfigSettings.ipMask));
+      // ConfigSettings.disconnectEthTime = millis();
     }
+    else
+    {
+      DEBUG_PRINTLN(F("ETH DHCP"));
+    }
+  }
+  else
+  {
+    DEBUG_PRINTLN(F("LAN start err"));
+    // esp_eth_stop();
+  }
 }
 
-void startSoketServer(){
+void startSocketServer()
+{
   server.begin(ConfigSettings.socketPort);
   server.setNoDelay(true);
 }
 
-void startServers(bool usb = false){
-  initWebServer();
-  if(!usb) startSoketServer();
-  startAP(false);
-  mDNS_start();
+void wgBegin()
+{
+  if (!wg.is_initialized())
+  {
+    //printLogMsg(String("Initializing WireGuard interface..."));
+    if (!wg.begin(
+            WgSettings.localIP,
+            WgSettings.localPrivKey,
+            WgSettings.endAddr,
+            WgSettings.endPubKey,
+            WgSettings.endPort))
+    {
+      printLogMsg(String("Failed to initialize WG"));
+      WgSettings.init = false;
+    }
+    else
+    {
+      printLogMsg(String("WG was initialized"));
+      WgSettings.init = true;
+    }
+  }
 }
 
-void handletmrNetworkOverseer(){
-  switch (ConfigSettings.coordinator_mode){
+void startServers(bool usb = false)
+{
+  initWebServer();
+  if (!usb)
+    startSocketServer();
+  startAP(false);
+  mDNS_start();
+  getZbVer();
+  if (WgSettings.enable)
+  {
+    wgBegin();
+  }
+}
+
+void handleTmrNetworkOverseer()
+{
+  switch (ConfigSettings.coordinator_mode)
+  {
   case COORDINATOR_MODE_WIFI:
-    DEBUG_PRINTLN(F("WiFi.status()"));
+    DEBUG_PRINT(F("WiFi.status = "));
     DEBUG_PRINTLN(WiFi.status());
-    if(WiFi.isConnected()){
+    if (WiFi.isConnected())
+    {
       DEBUG_PRINTLN(F("WIFI CONNECTED"));
-      DEBUG_PRINTLN(F(" "));
-      DEBUG_PRINTLN(WiFi.localIP());
-      DEBUG_PRINTLN(WiFi.subnetMask());
-      DEBUG_PRINTLN(WiFi.gatewayIP());
       startServers();
       tmrNetworkOverseer.stop();
-    }else{
-      if (tmrNetworkOverseer.counter() > overseerMaxRetry){
+    }
+    else
+    {
+      if (tmrNetworkOverseer.counter() > overseerMaxRetry)
+      {
         DEBUG_PRINTLN(F("WIFI counter overflow"));
         startAP(true);
         connectWifi();
       }
     }
-  break;
+    break;
   case COORDINATOR_MODE_LAN:
-    if (ConfigSettings.connectedEther){
+    if (ConfigSettings.connectedEther)
+    {
       DEBUG_PRINTLN(F("LAN CONNECTED"));
       startServers();
       tmrNetworkOverseer.stop();
-    }else{
-      if (tmrNetworkOverseer.counter() > overseerMaxRetry){
+    }
+    else
+    {
+      if (tmrNetworkOverseer.counter() > overseerMaxRetry)
+      {
         DEBUG_PRINTLN(F("LAN counter overflow"));
         startAP(true);
       }
     }
-  break;
+    break;
   case COORDINATOR_MODE_USB:
-    if (tmrNetworkOverseer.counter() > 3){//10 seconds for wifi connect
-      if(WiFi.isConnected()){
+    if (tmrNetworkOverseer.counter() > 3)
+    { // 10 seconds for wifi connect
+      if (WiFi.isConnected())
+      {
         tmrNetworkOverseer.stop();
         startServers(true);
-      }else{
+      }
+      else
+      {
         initLan();
-        if(tmrNetworkOverseer.counter() > 6){//3sec for lan
-          if(ConfigSettings.connectedEther){
+        if (tmrNetworkOverseer.counter() > 6)
+        { // 3sec for lan
+          if (ConfigSettings.connectedEther)
+          {
             tmrNetworkOverseer.stop();
             startServers(true);
-          }else{//no network interfaces
-            tmrNetworkOverseer.stop();//stop timer
+          }
+          else
+          {                            // no network interfaces
+            tmrNetworkOverseer.stop(); // stop timer
             startAP(true);
           }
         }
       }
     }
-  break;
-  
+    break;
+
   default:
     break;
   }
 }
 
-void WiFiEvent(WiFiEvent_t event){ 
-  DEBUG_PRINT(F("WiFiEvent "));
+void NetworkEvent(WiFiEvent_t event)
+{
+  DEBUG_PRINT(F("NetworkEvent "));
   DEBUG_PRINTLN(event);
-  switch (event){
-  case 18://SYSTEM_EVENT_ETH_START:
+  switch (event)
+  {
+  case ARDUINO_EVENT_ETH_START: // 18: // SYSTEM_EVENT_ETH_START:
     DEBUG_PRINTLN(F("ETH Started"));
-    //ConfigSettings.disconnectEthTime = millis();
+    // ConfigSettings.disconnectEthTime = millis();
     ETH.setHostname(ConfigSettings.hostname);
     break;
-  case 20://SYSTEM_EVENT_ETH_CONNECTED:
+  case ARDUINO_EVENT_ETH_CONNECTED: // 20: // SYSTEM_EVENT_ETH_CONNECTED:
     DEBUG_PRINTLN(F("ETH Connected"));
     break;
-  case 22://SYSTEM_EVENT_ETH_GOT_IP:
+  case ARDUINO_EVENT_ETH_GOT_IP: // 22: // SYSTEM_EVENT_ETH_GOT_IP:
     DEBUG_PRINTLN(F("ETH MAC: "));
     DEBUG_PRINT(ETH.macAddress());
     DEBUG_PRINT(F(", IPv4: "));
     DEBUG_PRINT(ETH.localIP());
-    if (ETH.fullDuplex()){
+    if (ETH.fullDuplex())
+    {
       DEBUG_PRINT(F(", FULL_DUPLEX"));
     }
     DEBUG_PRINT(F(", "));
     DEBUG_PRINT(ETH.linkSpeed());
     DEBUG_PRINTLN(F("Mbps"));
-      ConfigSettings.connectedEther = true;
-      //ConfigSettings.disconnectEthTime = 0;
-      //mDNS_start();
+    ConfigSettings.connectedEther = true;
+    // ConfigSettings.disconnectEthTime = 0;
+    // mDNS_start();
+    setClock();
     break;
-  case SYSTEM_EVENT_STA_GOT_IP:
-    DEBUG_PRINTLN(F("SYSTEM_EVENT_STA_GOT_IP"));
-  case 21://SYSTEM_EVENT_ETH_DISCONNECTED:
+  case ARDUINO_EVENT_ETH_DISCONNECTED: // 21:  //SYSTEM_EVENT_ETH_DISCONNECTED:
     DEBUG_PRINTLN(F("ETH Disconnected"));
     ConfigSettings.connectedEther = false;
-    //ConfigSettings.disconnectEthTime = millis();
-    if(tmrNetworkOverseer.state() == STOPPED && ConfigSettings.coordinator_mode == COORDINATOR_MODE_LAN){
+    // ConfigSettings.disconnectEthTime = millis();
+    if (tmrNetworkOverseer.state() == STOPPED && ConfigSettings.coordinator_mode == COORDINATOR_MODE_LAN)
+    {
       tmrNetworkOverseer.start();
     }
     break;
-  case SYSTEM_EVENT_ETH_STOP:
+  case SYSTEM_EVENT_ETH_STOP: // 27:
+  case ARDUINO_EVENT_ETH_STOP:
     DEBUG_PRINTLN(F("ETH Stopped"));
     ConfigSettings.connectedEther = false;
-    //ConfigSettings.disconnectEthTime = millis();
-    if(tmrNetworkOverseer.state() == STOPPED){
+    // ConfigSettings.disconnectEthTime = millis();
+    if (tmrNetworkOverseer.state() == STOPPED)
+    {
       tmrNetworkOverseer.start();
     }
     break;
-  case SYSTEM_EVENT_STA_DISCONNECTED:
+  case ARDUINO_EVENT_WIFI_STA_GOT_IP: // SYSTEM_EVENT_STA_GOT_IP:
+    DEBUG_PRINTLN(F("WiFi"));
+    DEBUG_PRINT(F("IPv4: "));
+    DEBUG_PRINT(WiFi.localIP().toString());
+    DEBUG_PRINT(F(", "));
+    DEBUG_PRINT(WiFi.subnetMask().toString());
+    DEBUG_PRINT(F(", "));
+    DEBUG_PRINTLN(WiFi.gatewayIP().toString());
+    setClock();
+    break;
+  case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: // SYSTEM_EVENT_STA_DISCONNECTED:
     DEBUG_PRINTLN(F("WIFI STA DISCONNECTED"));
-    if(tmrNetworkOverseer.state() == STOPPED){
+    if (tmrNetworkOverseer.state() == STOPPED)
+    {
       tmrNetworkOverseer.start();
     }
     break;
@@ -197,7 +269,8 @@ void WiFiEvent(WiFiEvent_t event){
   }
 }
 
-IPAddress parse_ip_address(const char *str){
+IPAddress parse_ip_address(const char *str)
+{
   IPAddress result;
   int index = 0;
 
@@ -223,7 +296,8 @@ IPAddress parse_ip_address(const char *str){
   return result;
 }
 
-bool loadSystemVar(){//todo remove
+bool loadSystemVar()
+{ // todo remove
   File configFile = LittleFS.open(configFileSystem, FILE_READ);
   if (!configFile)
   {
@@ -271,22 +345,23 @@ bool loadSystemVar(){//todo remove
     DEBUG_PRINTLN(F("saved tempOffset in system.json"));
     ConfigSettings.tempOffset = int(tempOffset.toInt());
   }
-  //ConfigSettings.restarts = (int)doc["restarts"];
   configFile.close();
   return true;
 }
 
-bool loadConfigWifi(){
+bool loadConfigWifi()
+{
   File configFile = LittleFS.open(configFileWifi, FILE_READ);
-  const char* enableWiFi = "enableWiFi";
-  const char* ssid = "ssid";
-  const char* pass = "pass";
-  const char* dhcpWiFi = "dhcpWiFi";
-  const char* ip = "ip";
-  const char* mask = "mask";
-  const char* gw = "gw";
-  if (!configFile){
-    //String StringConfig = "{\"enableWiFi\":0,\"ssid\":\"\",\"pass\":\"\",\"dhcpWiFi\":1,\"ip\":\"\",\"mask\":\"\",\"gw\":\"\",\"disableEmerg\":1}";
+  const char *enableWiFi = "enableWiFi";
+  const char *ssid = "ssid";
+  const char *pass = "pass";
+  const char *dhcpWiFi = "dhcpWiFi";
+  const char *ip = "ip";
+  const char *mask = "mask";
+  const char *gw = "gw";
+  if (!configFile)
+  {
+    // String StringConfig = "{\"enableWiFi\":0,\"ssid\":\"\",\"pass\":\"\",\"dhcpWiFi\":1,\"ip\":\"\",\"mask\":\"\",\"gw\":\"\",\"disableEmerg\":1}";
     DynamicJsonDocument doc(1024);
     doc[enableWiFi] = 0;
     doc[ssid] = "";
@@ -295,7 +370,7 @@ bool loadConfigWifi(){
     doc[ip] = "";
     doc[mask] = "";
     doc[gw] = "";
-    writeDefultConfig(configFileWifi, doc);
+    writeDefaultConfig(configFileWifi, doc);
   }
 
   configFile = LittleFS.open(configFileWifi, FILE_READ);
@@ -318,28 +393,30 @@ bool loadConfigWifi(){
   strlcpy(ConfigSettings.ipAddressWiFi, doc[ip] | "", sizeof(ConfigSettings.ipAddressWiFi));
   strlcpy(ConfigSettings.ipMaskWiFi, doc[mask] | "", sizeof(ConfigSettings.ipMaskWiFi));
   strlcpy(ConfigSettings.ipGWWiFi, doc[gw] | "", sizeof(ConfigSettings.ipGWWiFi));
-  //ConfigSettings.enableWiFi = (int)doc["enableWiFi"];
-  //ConfigSettings.disableEmerg = (int)doc["disableEmerg"];
+  // ConfigSettings.enableWiFi = (int)doc["enableWiFi"];
+  // ConfigSettings.disableEmerg = (int)doc["disableEmerg"];
 
   configFile.close();
   return true;
 }
 
-bool loadConfigEther(){
-  const char* dhcp = "dhcp";
-  const char* ip = "ip";
-  const char* mask = "mask";
-  const char* gw = "gw";
+bool loadConfigEther()
+{
+  const char *dhcp = "dhcp";
+  const char *ip = "ip";
+  const char *mask = "mask";
+  const char *gw = "gw";
   File configFile = LittleFS.open(configFileEther, FILE_READ);
-  if (!configFile){
+  if (!configFile)
+  {
     DynamicJsonDocument doc(1024);
     doc[dhcp] = 1;
     doc[ip] = "";
     doc[mask] = "";
     doc[gw] = "";
-    //doc["disablePingCtrl"] = 0;
-    //String StringConfig = "{\"dhcp\":1,\"ip\":\"\",\"mask\":\"\",\"gw\":\"\",\"disablePingCtrl\":0}";
-    writeDefultConfig(configFileEther, doc);
+    // doc["disablePingCtrl"] = 0;
+    // String StringConfig = "{\"dhcp\":1,\"ip\":\"\",\"mask\":\"\",\"gw\":\"\",\"disablePingCtrl\":0}";
+    writeDefaultConfig(configFileEther, doc);
   }
 
   configFile = LittleFS.open(configFileEther, FILE_READ);
@@ -360,37 +437,40 @@ bool loadConfigEther(){
   strlcpy(ConfigSettings.ipAddress, doc[ip] | "", sizeof(ConfigSettings.ipAddress));
   strlcpy(ConfigSettings.ipMask, doc[mask] | "", sizeof(ConfigSettings.ipMask));
   strlcpy(ConfigSettings.ipGW, doc[gw] | "", sizeof(ConfigSettings.ipGW));
-  //ConfigSettings.disablePingCtrl = (int)doc["disablePingCtrl"];
+  // ConfigSettings.disablePingCtrl = (int)doc["disablePingCtrl"];
 
   configFile.close();
   return true;
 }
 
-bool loadConfigGeneral(){
-  const char* hostname = "hostname";
-  const char* disableLeds = "disableLeds";
-  const char* refreshLogs = "refreshLogs";
-  const char* disableLedYellow = "disableLedYellow";
-  const char* disableLedBlue = "disableLedBlue";
-  const char* prevCoordMode = "prevCoordMode";
-  const char* keepWeb = "keepWeb";
+bool loadConfigGeneral()
+{
+  const char *hostname = "hostname";
+  const char *disableLeds = "disableLeds";
+  const char *refreshLogs = "refreshLogs";
+  const char *disableLedPwr = "disableLedPwr";
+  const char *disableLedUSB = "disableLedUSB";
+  const char *prevCoordMode = "prevCoordMode";
+  const char *keepWeb = "keepWeb";
+  const char *timeZoneName = "timeZoneName";
   File configFile = LittleFS.open(configFileGeneral, FILE_READ);
   DEBUG_PRINTLN(configFile.readString());
-  if (!configFile){
-    //String deviceID = deviceModel;
-    //getDeviceID(deviceID);
+  if (!configFile)
+  {
+    // String deviceID = deviceModel;
+    // getDeviceID(deviceID);
     DEBUG_PRINTLN("RESET ConfigGeneral");
-    //String StringConfig = "{\"hostname\":\"" + deviceID + "\",\"disableLeds\": false,\"refreshLogs\":1000,\"usbMode\":0,\"disableLedYellow\":0,\"disableLedBlue\":0,\""+ coordMode +"\":0}\""+ prevCoordMode +"\":0, \"keepWeb\": 0}";
+    // String StringConfig = "{\"hostname\":\"" + deviceID + "\",\"disableLeds\": false,\"refreshLogs\":1000,\"usbMode\":0,\"disableLedPwr\":0,\"disableLedUSB\":0,\""+ coordMode +"\":0}\""+ prevCoordMode +"\":0, \"keepWeb\": 0}";
     DynamicJsonDocument doc(1024);
     doc[hostname] = deviceModel;
     doc[disableLeds] = 0;
     doc[refreshLogs] = 1000;
-    doc[disableLedYellow] = 0;
-    doc[disableLedBlue] = 0;
+    doc[disableLedPwr] = 0;
+    doc[disableLedUSB] = 0;
     doc[coordMode] = 0;
     doc[prevCoordMode] = 0;
     doc[keepWeb] = 0;
-    writeDefultConfig(configFileGeneral, doc);
+    writeDefaultConfig(configFileGeneral, doc);
   }
 
   configFile = LittleFS.open(configFileGeneral, FILE_READ);
@@ -422,28 +502,32 @@ bool loadConfigGeneral(){
   ConfigSettings.prevCoordinator_mode = static_cast<COORDINATOR_MODE_t>((uint8_t)doc[prevCoordMode]);
   DEBUG_PRINTLN(F("[loadConfigGeneral] 'static_cast' res is:"));
   DEBUG_PRINTLN(String(ConfigSettings.coordinator_mode));
-  ConfigSettings.disableLedYellow = (uint8_t)doc[disableLedYellow];
-  DEBUG_PRINTLN(F("[loadConfigGeneral] disableLedYellow"));
-  ConfigSettings.disableLedBlue = (uint8_t)doc[disableLedBlue];
-  DEBUG_PRINTLN(F("[loadConfigGeneral] disableLedBlue"));
+  ConfigSettings.disableLedPwr = (uint8_t)doc[disableLedPwr];
+  // DEBUG_PRINTLN(F("[loadConfigGeneral] disableLedPwr"));
+  ConfigSettings.disableLedUSB = (uint8_t)doc[disableLedUSB];
+  // DEBUG_PRINTLN(F("[loadConfigGeneral] disableLedUSB"));
   ConfigSettings.disableLeds = (uint8_t)doc[disableLeds];
-  DEBUG_PRINTLN(F("[loadConfigGeneral] disableLeds"));
+  // DEBUG_PRINTLN(F("[loadConfigGeneral] disableLeds"));
   ConfigSettings.keepWeb = (uint8_t)doc[keepWeb];
+  // DEBUG_PRINTLN(F("[loadConfigGeneral] disableLeds"));
+  strlcpy(ConfigSettings.timeZone, doc[timeZoneName] | "", sizeof(ConfigSettings.timeZone));
   configFile.close();
   DEBUG_PRINTLN(F("[loadConfigGeneral] config load done"));
   return true;
 }
 
-bool loadConfigSecurity(){
-  const char* disableWeb = "disableWeb";
-  const char* webAuth = "webAuth";
-  const char* webUser = "webUser";
-  const char* webPass = "webPass";
-  const char* fwEnabled = "fwEnabled";
-  const char* fwIp = "fwIp";
+bool loadConfigSecurity()
+{
+  const char *disableWeb = "disableWeb";
+  const char *webAuth = "webAuth";
+  const char *webUser = "webUser";
+  const char *webPass = "webPass";
+  const char *fwEnabled = "fwEnabled";
+  const char *fwIp = "fwIp";
   File configFile = LittleFS.open(configFileSecurity, FILE_READ);
-  if (!configFile){
-    //String StringConfig = "{\"disableWeb\":0,\"webAuth\":0,\"webUser\":"",\"webPass\":""}";
+  if (!configFile)
+  {
+    // String StringConfig = "{\"disableWeb\":0,\"webAuth\":0,\"webUser\":"",\"webPass\":""}";
     DynamicJsonDocument doc(1024);
     doc[disableWeb] = 0;
     doc[webAuth] = 0;
@@ -451,7 +535,7 @@ bool loadConfigSecurity(){
     doc[webPass] = "";
     doc[fwEnabled] = 0;
     doc[fwIp] = "";
-    writeDefultConfig(configFileSecurity, doc);
+    writeDefaultConfig(configFileSecurity, doc);
   }
 
   configFile = LittleFS.open(configFileSecurity, FILE_READ);
@@ -479,16 +563,18 @@ bool loadConfigSecurity(){
   return true;
 }
 
-bool loadConfigSerial(){
-  const char* baud = "baud";
-  const char* port = "port";
+bool loadConfigSerial()
+{
+  const char *baud = "baud";
+  const char *port = "port";
   File configFile = LittleFS.open(configFileSerial, FILE_READ);
-  if (!configFile){
-    //String StringConfig = "{\"baud\":115200,\"port\":6638}";
+  if (!configFile)
+  {
+    // String StringConfig = "{\"baud\":115200,\"port\":6638}";
     DynamicJsonDocument doc(1024);
     doc[baud] = 115200;
     doc[port] = 6638;
-    writeDefultConfig(configFileSerial, doc);
+    writeDefaultConfig(configFileSerial, doc);
   }
 
   configFile = LittleFS.open(configFileSerial, FILE_READ);
@@ -515,20 +601,134 @@ bool loadConfigSerial(){
   return true;
 }
 
-void startAP(const bool start){
-  if (ConfigSettings.apStarted){
-    if (!start){
-      if(ConfigSettings.coordinator_mode != COORDINATOR_MODE_WIFI){
-        WiFi.softAPdisconnect(true);//off wifi
-      }else{
+bool loadConfigMqtt()
+{
+  const char *enable = "enable";
+  const char *server = "server";
+  const char *port = "port";
+  const char *user = "user";
+  const char *pass = "pass";
+  const char *topic = "topic";
+  const char *interval = "interval";
+  const char *discovery = "discovery";
+
+  File configFile = LittleFS.open(configFileMqtt, FILE_READ);
+  if (!configFile)
+  {
+    char deviceIdArr[20];
+    getDeviceID(deviceIdArr);
+
+    DynamicJsonDocument doc(1024);
+    doc[enable] = 0;
+    doc[server] = "";
+    doc[port] = 1883;
+    doc[user] = "mqttuser";
+    doc[pass] = "";
+    doc[topic] = String(deviceIdArr);
+    doc[interval] = 60;
+    doc[discovery] = 0;
+    writeDefaultConfig(configFileMqtt, doc);
+  }
+
+  configFile = LittleFS.open(configFileMqtt, FILE_READ);
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, configFile);
+
+  if (error)
+  {
+    DEBUG_PRINTLN(F("deserializeJson() failed: "));
+    DEBUG_PRINTLN(error.f_str());
+    configFile.close();
+    LittleFS.remove(configFileMqtt);
+    return false;
+  }
+
+  MqttSettings.enable = (int)doc[enable];
+  strlcpy(MqttSettings.server, doc[server] | "", sizeof(MqttSettings.server));
+  MqttSettings.serverIP = parse_ip_address(MqttSettings.server);
+  MqttSettings.port = (int)doc[port];
+  strlcpy(MqttSettings.user, doc[user] | "", sizeof(MqttSettings.user));
+  strlcpy(MqttSettings.pass, doc[pass] | "", sizeof(MqttSettings.pass));
+  strlcpy(MqttSettings.topic, doc[topic] | "", sizeof(MqttSettings.topic));
+  MqttSettings.interval = (int)doc[interval];
+  MqttSettings.discovery = (int)doc[discovery];
+
+  configFile.close();
+  return true;
+}
+
+bool loadConfigWg()
+{
+  const char *enable = "enable";
+  const char *localAddr = "localAddr";
+  const char *localIP = "localIP";
+  const char *endAddr = "endAddr";
+  const char *endPubKey = "endPubKey";
+  const char *endPort = "endPort";
+
+  File configFile = LittleFS.open(configFileWg, FILE_READ);
+  if (!configFile)
+  {
+    DynamicJsonDocument doc(1024);
+    doc[enable] = 0;
+    doc[localAddr] = "";
+    doc[localIP] = "";
+    doc[endAddr] = "";
+    doc[endPubKey] = "";
+    doc[endPort] = "";
+    writeDefaultConfig(configFileWg, doc);
+  }
+
+  configFile = LittleFS.open(configFileWg, FILE_READ);
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, configFile);
+
+  if (error)
+  {
+    DEBUG_PRINTLN(F("deserializeJson() failed: "));
+    DEBUG_PRINTLN(error.f_str());
+    configFile.close();
+    LittleFS.remove(configFileWg);
+    return false;
+  }
+
+  WgSettings.enable = (int)doc[enable];
+
+  strlcpy(WgSettings.localAddr, doc[localAddr] | "", sizeof(WgSettings.localAddr));
+  WgSettings.localIP = parse_ip_address(WgSettings.localAddr);
+
+  strlcpy(WgSettings.localPrivKey, doc[localIP] | "", sizeof(WgSettings.localPrivKey));
+  strlcpy(WgSettings.endAddr, doc[endAddr] | "", sizeof(WgSettings.endAddr));
+  strlcpy(WgSettings.endPubKey, doc[endPubKey] | "", sizeof(WgSettings.endPubKey));
+  WgSettings.endPort = (int)doc[endPort];
+
+  configFile.close();
+  return true;
+}
+
+void startAP(const bool start)
+{
+  if (ConfigSettings.apStarted)
+  {
+    if (!start)
+    {
+      if (ConfigSettings.coordinator_mode != COORDINATOR_MODE_WIFI)
+      {
+        WiFi.softAPdisconnect(true); // off wifi
+      }
+      else
+      {
         WiFi.mode(WIFI_STA);
       }
       dnsServer.stop();
       ConfigSettings.apStarted = false;
     }
-  }else{
-    if(!start) return;
-    WiFi.mode(WIFI_AP_STA);//WIFI_AP_STA for possible wifi scan in wifi mode
+  }
+  else
+  {
+    if (!start)
+      return;
+    WiFi.mode(WIFI_AP_STA); // WIFI_AP_STA for possible wifi scan in wifi mode
     WiFi.disconnect();
     // String AP_NameString;
     // getDeviceID(AP_NameString);
@@ -539,7 +739,7 @@ void startAP(const bool start){
     // for (int i = 0; i < AP_NameString.length(); i++){
     //   AP_NameChar[i] = AP_NameString.charAt(i);
     // }
-      
+
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
     char apSsid[18];
     getDeviceID(apSsid);
@@ -549,30 +749,38 @@ void startAP(const bool start){
     dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
     dnsServer.start(53, "*", apIP);
     WiFi.setSleep(false);
-    //ConfigSettings.wifiAPenblTime = millis();
+    // ConfigSettings.wifiAPenblTime = millis();
     startServers();
     ConfigSettings.apStarted = true;
   }
 }
 
-void connectWifi(){
+void connectWifi()
+{
   static uint8_t timeout = 0;
-  if (WiFi.status() == WL_IDLE_STATUS && timeout < 20){//connection in progress
+  if (WiFi.status() == WL_IDLE_STATUS && timeout < 20)
+  { // connection in progress
     DEBUG_PRINTLN(F("[connectWifi] WL_IDLE_STATUS"));
     timeout++;
-    return; 
-  }else{
+    return;
+  }
+  else
+  {
     timeout = 0;
     DEBUG_PRINTLN(F("[connectWifi] timeout"));
   }
   WiFi.persistent(false);
   esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
-  if ((strlen(ConfigSettings.ssid) >= 2) && (strlen(ConfigSettings.password) >= 8)){
+  if ((strlen(ConfigSettings.ssid) >= 2) && (strlen(ConfigSettings.password) >= 8))
+  {
     DEBUG_PRINTLN(F("[connectWifi] Ok SSID & PASS"));
-    if (ConfigSettings.apStarted){
+    if (ConfigSettings.apStarted)
+    {
       // DEBUG_PRINTLN(F("[connectWifi] WiFi.mode(WIFI_AP_STA)"));
       // WiFi.mode(WIFI_AP_STA);
-    }else{
+    }
+    else
+    {
       DEBUG_PRINTLN(F("[connectWifi] WiFi.mode(WIFI_STA)"));
       WiFi.mode(WIFI_STA);
     }
@@ -582,17 +790,23 @@ void connectWifi(){
     WiFi.setSleep(false);
     DEBUG_PRINTLN(F("[connectWifi] WiFi.begin"));
 
-    if (!ConfigSettings.dhcpWiFi){
+    if (!ConfigSettings.dhcpWiFi)
+    {
       IPAddress ip_address = parse_ip_address(ConfigSettings.ipAddressWiFi);
       IPAddress gateway_address = parse_ip_address(ConfigSettings.ipGWWiFi);
       IPAddress netmask = parse_ip_address(ConfigSettings.ipMaskWiFi);
       WiFi.config(ip_address, gateway_address, netmask);
       DEBUG_PRINTLN(F("[connectWifi] WiFi.config"));
-    }else{
+    }
+    else
+    {
       DEBUG_PRINTLN(F("[connectWifi] Try DHCP"));
     }
-  }else{
-    if(!(ConfigSettings.coordinator_mode == COORDINATOR_MODE_USB && ConfigSettings.keepWeb)){//dont start ap in keepWeb
+  }
+  else
+  {
+    if (!(ConfigSettings.coordinator_mode == COORDINATOR_MODE_USB && ConfigSettings.keepWeb))
+    { // dont start ap in keepWeb
       DEBUG_PRINTLN(F("[connectWifi] NO SSID & PASS"));
       startAP(true);
       DEBUG_PRINTLN(F("[connectWifi] setupWifiAP"));
@@ -602,15 +816,17 @@ void connectWifi(){
 
 void mDNS_start()
 {
-  const char* host = "_uzg-01";
-  const char* http = "_http";
-  const char* tcp = "_tcp";
+  const char *host = "_uzg-01";
+  const char *http = "_http";
+  const char *tcp = "_tcp";
   if (!MDNS.begin(ConfigSettings.hostname))
   {
     printLogMsg("Error setting up MDNS responder!");
-  }else{
+  }
+  else
+  {
     printLogMsg("mDNS responder started");
-    MDNS.addService(http, tcp, 80);//web
+    MDNS.addService(http, tcp, 80); // web
     //--zeroconf zha--
     MDNS.addService(host, tcp, ConfigSettings.socketPort);
     MDNS.addServiceTxt(host, tcp, "version", "1.0");
@@ -620,88 +836,114 @@ void mDNS_start()
   }
 }
 
-IRAM_ATTR bool debounce() {
-    volatile static unsigned long lastFire = 0;
-    if (millis() - lastFire < DEBOUNCE_TIME) {  // Debounce
-        return 0;
-    }
-    lastFire = millis();
-    return 1;
+IRAM_ATTR bool debounce()
+{
+  volatile static unsigned long lastFire = 0;
+  if (millis() - lastFire < DEBOUNCE_TIME)
+  { // Debounce
+    return 0;
+  }
+  lastFire = millis();
+  return 1;
 }
 
-IRAM_ATTR void btnInterrupt() {
-    if (debounce()) btnFlag = true;
+IRAM_ATTR void btnInterrupt()
+{
+  if (debounce())
+    btnFlag = true;
 }
 
-void setLedsDisable(bool mode, bool setup){
+void setLedsDisable(bool mode, bool setup)
+{
   DEBUG_PRINTLN(F("[setLedsDisable] start"));
-  if(!setup){
+  if (!setup)
+  {
     const char *path = configFileGeneral;
     DynamicJsonDocument doc(300);
     File configFile = LittleFS.open(path, FILE_READ);
     deserializeJson(doc, configFile);
     configFile.close();
     doc["disableLeds"] = mode;
-    doc["disableLedYellow"] = mode;
-    doc["disableLedBlue"] = mode;
+    doc["disableLedPwr"] = mode;
+    doc["disableLedUSB"] = mode;
     configFile = LittleFS.open(path, FILE_WRITE);
     serializeJson(doc, configFile);
     configFile.close();
     ConfigSettings.disableLeds = mode;
-    ConfigSettings.disableLedYellow = mode;
-    ConfigSettings.disableLedBlue = mode;
+    ConfigSettings.disableLedPwr = mode;
+    ConfigSettings.disableLedUSB = mode;
   }
-  if(mode){
-    digitalWrite(LED_RED, !mode);
-    digitalWrite(LED_BLUE, !mode);
-  }else{
-    if(!ConfigSettings.disableLedYellow){
-      digitalWrite(LED_BLUE, !mode);
-    }else{
-      digitalWrite(LED_BLUE, 0);
+  if (mode)
+  {
+    digitalWrite(LED_USB, !mode);
+    digitalWrite(LED_PWR, !mode);
+  }
+  else
+  {
+    if (!ConfigSettings.disableLedPwr)
+    {
+      digitalWrite(LED_PWR, !mode);
     }
-    if(ConfigSettings.coordinator_mode == COORDINATOR_MODE_USB && !ConfigSettings.disableLedBlue){
-      digitalWrite(LED_RED, !mode);
-    }else{
-      digitalWrite(LED_RED, 0);
+    else
+    {
+      digitalWrite(LED_PWR, 0);
+    }
+    if (ConfigSettings.coordinator_mode == COORDINATOR_MODE_USB && !ConfigSettings.disableLedUSB)
+    {
+      digitalWrite(LED_USB, !mode);
+    }
+    else
+    {
+      digitalWrite(LED_USB, 0);
     }
   }
   DEBUG_PRINTLN(F("[setLedsDisable] done"));
 }
 
-void handlelongBtn() {
-    if (!digitalRead(BTN)) {//long press
-      DEBUG_PRINT(F("Long press "));
-      DEBUG_PRINT(btnFlag);
-      DEBUG_PRINTLN(F("s"));
-      if (btnFlag >= 4) {
-        printLogMsg("Long press 4sec - zigbeeEnableBSL");
-        zigbeeEnableBSL();
-        tmrBtnLongPress.stop();
-        btnFlag = false;
-      }
-      else btnFlag++;
-    } else { //stop long press
-        if (btnFlag >= 2) {
-          printLogMsg("Long press 2sec - setLedsDisable");
-          setLedsDisable(!ConfigSettings.disableLeds, false);
-        }
-        tmrBtnLongPress.stop();
-        btnFlag = false;
-        printLogMsg("Stop long press");
+void handleLongBtn()
+{
+  if (!digitalRead(BTN))
+  { // long press
+    DEBUG_PRINT(F("Long press "));
+    DEBUG_PRINT(btnFlag);
+    DEBUG_PRINTLN(F("s"));
+    if (btnFlag >= 4)
+    {
+      printLogMsg("Long press 4sec - zigbeeEnableBSL");
+      zigbeeEnableBSL();
+      tmrBtnLongPress.stop();
+      btnFlag = false;
     }
+    else
+      btnFlag++;
+  }
+  else
+  { // stop long press
+    if (btnFlag >= 2)
+    {
+      printLogMsg("Long press 2sec - setLedsDisable");
+      setLedsDisable(!ConfigSettings.disableLeds, false);
+    }
+    tmrBtnLongPress.stop();
+    btnFlag = false;
+    printLogMsg("Stop long press");
+  }
 }
 
-void toggleUsbMode(){
+void toggleUsbMode()
+{
   DEBUG_PRINTLN(F("prevCoordMode"));
   DEBUG_PRINTLN(prevCoordMode);
   DEBUG_PRINTLN(F("coordMode"));
   DEBUG_PRINTLN(coordMode);
-  if(ConfigSettings.coordinator_mode != COORDINATOR_MODE_USB){
-    ConfigSettings.prevCoordinator_mode = ConfigSettings.coordinator_mode; //remember current state
-    ConfigSettings.coordinator_mode = COORDINATOR_MODE_USB; //toggle
+  if (ConfigSettings.coordinator_mode != COORDINATOR_MODE_USB)
+  {
+    ConfigSettings.prevCoordinator_mode = ConfigSettings.coordinator_mode; // remember current state
+    ConfigSettings.coordinator_mode = COORDINATOR_MODE_USB;                // toggle
     DEBUG_PRINTLN(F("Change usb mode to USB"));
-  }else{
+  }
+  else
+  {
     ConfigSettings.coordinator_mode = ConfigSettings.prevCoordinator_mode;
     DEBUG_PRINTLN(F("Change usb mode to:"));
     DEBUG_PRINTLN(String(ConfigSettings.coordinator_mode));
@@ -716,12 +958,14 @@ void toggleUsbMode(){
   configFile = LittleFS.open(path, FILE_WRITE);
   serializeJson(doc, configFile);
   configFile.close();
-  digitalWrite(LED_RED, ConfigSettings.coordinator_mode == COORDINATOR_MODE_USB ? 1 : 0);
+  digitalWrite(LED_USB, ConfigSettings.coordinator_mode == COORDINATOR_MODE_USB ? 1 : 0);
   ESP.restart();
 }
 
-void setupCoordinatorMode(){
-  if (ConfigSettings.coordinator_mode > 2 || ConfigSettings.coordinator_mode < 0){
+void setupCoordinatorMode()
+{
+  if (ConfigSettings.coordinator_mode > 2 || ConfigSettings.coordinator_mode < 0)
+  {
     DEBUG_PRINTLN(F("WRONG MODE DETECTED, set to LAN"));
     ConfigSettings.coordinator_mode = COORDINATOR_MODE_LAN;
   }
@@ -729,33 +973,38 @@ void setupCoordinatorMode(){
   DEBUG_PRINTLN(F("Mode is:"));
   DEBUG_PRINTLN(ConfigSettings.coordinator_mode);
   DEBUG_PRINTLN(F("--------------"));
-  if(ConfigSettings.coordinator_mode != COORDINATOR_MODE_USB || ConfigSettings.keepWeb){//start network overseer
-    if(tmrNetworkOverseer.state() == STOPPED){
+  if (ConfigSettings.coordinator_mode != COORDINATOR_MODE_USB || ConfigSettings.keepWeb)
+  { // start network overseer
+    if (tmrNetworkOverseer.state() == STOPPED)
+    {
       tmrNetworkOverseer.start();
     }
-    WiFi.onEvent(WiFiEvent);
+    WiFi.onEvent(NetworkEvent);
   }
-  switch (ConfigSettings.coordinator_mode){
-    case COORDINATOR_MODE_USB:
-      DEBUG_PRINTLN(F("Coordinator USB mode"));
-      digitalWrite(MODE_SWITCH, 1);
+  switch (ConfigSettings.coordinator_mode)
+  {
+  case COORDINATOR_MODE_USB:
+    DEBUG_PRINTLN(F("Coordinator USB mode"));
+    digitalWrite(MODE_SWITCH, 1);
     break;
 
-    case COORDINATOR_MODE_WIFI:
-      DEBUG_PRINTLN(F("Coordinator WIFI mode"));
-      connectWifi();
+  case COORDINATOR_MODE_WIFI:
+    DEBUG_PRINTLN(F("Coordinator WIFI mode"));
+    connectWifi();
     break;
 
-    case COORDINATOR_MODE_LAN:
-      DEBUG_PRINTLN(F("Coordinator LAN mode"));
-      initLan();
+  case COORDINATOR_MODE_LAN:
+    DEBUG_PRINTLN(F("Coordinator LAN mode"));
+    initLan();
     break;
-  
+
   default:
     break;
   }
-  if(!ConfigSettings.disableWeb && (ConfigSettings.coordinator_mode != COORDINATOR_MODE_USB || ConfigSettings.keepWeb)) updWeb = true;//handle web server
-  if(ConfigSettings.coordinator_mode == COORDINATOR_MODE_USB && ConfigSettings.keepWeb) connectWifi();//try 2 connect wifi
+  if (!ConfigSettings.disableWeb && (ConfigSettings.coordinator_mode != COORDINATOR_MODE_USB || ConfigSettings.keepWeb))
+    updWeb = true; // handle web server
+  if (ConfigSettings.coordinator_mode == COORDINATOR_MODE_USB && ConfigSettings.keepWeb)
+    connectWifi(); // try 2 connect wifi
 }
 
 // void cmd2zigbee(const HardwareSerial serial, byte cmd[], const byte size){
@@ -767,37 +1016,44 @@ void setupCoordinatorMode(){
 //   serial.write(cmd, size);
 // }
 
-void clearS2Buffer(){
-  while (Serial2.available()){//clear buffer
-    Serial2.read();
-  }
-}
+// void clearS2Buffer(){
+//   while (Serial2.available()){//clear buffer
+//     Serial2.read();
+//   }
+// }
 
-void setup(){
-  Serial.begin(115200);//todo ifdef DEBUG
+void setup()
+{
+  Serial.begin(115200); // todo ifdef DEBUG
   ConfigSettings.apStarted = false;
   ConfigSettings.serialSpeed = 115200;
   DEBUG_PRINTLN(F("Start"));
   pinMode(CC2652P_RST, OUTPUT);
-  pinMode(CC2652P_FLSH, OUTPUT);
+  pinMode(CC2652P_FLASH, OUTPUT);
   digitalWrite(CC2652P_RST, 1);
-  digitalWrite(CC2652P_FLSH, 1);
-  pinMode(LED_BLUE, OUTPUT);
-  pinMode(LED_RED, OUTPUT);
+  digitalWrite(CC2652P_FLASH, 1);
+  pinMode(LED_PWR, OUTPUT);
+  pinMode(LED_USB, OUTPUT);
   pinMode(BTN, INPUT);
   pinMode(MODE_SWITCH, OUTPUT);
-  digitalWrite(MODE_SWITCH, 0);//enable zigbee serial
-  digitalWrite(LED_BLUE, 1);
-  digitalWrite(LED_RED, 1);
+  digitalWrite(MODE_SWITCH, 0); // enable zigbee serial
+  digitalWrite(LED_PWR, 1);
+  digitalWrite(LED_USB, 1);
 
-  //hard reset
-  if(!digitalRead(BTN)){
+// hard reset
+#if BUILD_ENV_NAME != debug
+  if (!digitalRead(BTN))
+  {
     DEBUG_PRINTLN(F("[hard reset] Entering hard reset mode"));
     uint8_t counter = 0;
-    while (!digitalRead(BTN)){
-      if (counter >= 10){
+    while (!digitalRead(BTN))
+    {
+      if (counter >= 10)
+      {
         resetSettings();
-      }else{
+      }
+      else
+      {
         counter++;
         DEBUG_PRINTLN(counter);
         delay(200);
@@ -805,60 +1061,12 @@ void setup(){
     }
     DEBUG_PRINTLN(F("[hard reset] Btn up, exit"));
   }
+#endif
   //--------------------
 
-  //zig connection & leds testing 
-  const byte cmdLed0 = 0x27;
-  const byte cmdLed1 = 0x0A;
-  const byte cmdLedIndex = 0x01;//for led 1
-  const byte cmdLedStateOff = 0x00;
-  const byte cmdLedStateOn = 0x01;
-  const byte cmdFrameStart = 0xFE;
-  const byte cmdLedLen = 0x02;
-  const byte zigLed1Off[] = {cmdFrameStart, cmdLedLen, cmdLed0, cmdLed1, cmdLedIndex, cmdLedStateOff, 0x2E}; //resp FE 01 67 0A 00 6C
-  const byte zigLed1On[] = {cmdFrameStart, cmdLedLen, cmdLed0, cmdLed1, cmdLedIndex, cmdLedStateOn, 0x2F};
-  const byte cmdLedResp[] = {0xFE, 0x01, 0x67, 0x0A, 0x00, 0x6C};
-  Serial2.begin(115200, SERIAL_8N1, CC2652P_RXD, CC2652P_TXD); //start zigbee serial
-  bool respOk = false;
-  for (uint8_t i = 0; i < 12; i++){//wait for zigbee start
-    if(respOk) break;
-    clearS2Buffer();
-    Serial2.write(zigLed1On, sizeof(zigLed1On));
-    Serial2.flush();
-    delay(400);
-    for (uint8_t i = 0; i < 5; i++){
-      if (Serial2.read() != 0xFE){//check for packet start
-        Serial2.read();//skip
-      }else{
-        for (uint8_t i = 1; i < 4; i++){
-          if(Serial2.read() != cmdLedResp[i]){//check if resp ok
-            respOk = false;
-            break;
-          }else{
-            respOk = true;
-          }
-        }
-      }
-    }
-    digitalWrite(LED_RED, !digitalRead(LED_RED));//blue led flashing mean wait for zigbee resp
-  }
-  delay(500);
-  if(!respOk){
-    digitalWrite(LED_BLUE, 1);
-    digitalWrite(LED_RED, 1);
-    for (uint8_t i = 0; i < 5; i++){//indicate wrong resp
-          digitalWrite(LED_BLUE, !digitalRead(LED_BLUE));
-          digitalWrite(LED_RED, !digitalRead(LED_RED));
-          delay(1000);
-        }
-    printLogMsg("[ZBCHK] Wrong answer");
-  }else{
-    Serial2.write(zigLed1Off, sizeof(zigLed1Off));
-    Serial2.flush();
-    printLogMsg("[ZBCHK] connection established");
-  }
-  digitalWrite(LED_BLUE, 0);
-  digitalWrite(LED_RED, 0);
+  // zig connection & leds testing
+  Serial2.begin(115200, SERIAL_8N1, CC2652P_RXD, CC2652P_TXD); // start zigbee serial
+  zbInit();
   //-----------------
 
   attachInterrupt(digitalPinToInterrupt(BTN), btnInterrupt, FALLING);
@@ -889,10 +1097,6 @@ void setup(){
   else
   {
     DEBUG_PRINTLN(F("System vars load OK"));
-    // ConfigSettings.restarts++;
-    // DEBUG_PRINT(F("Restarts count "));
-    // DEBUG_PRINTLN(ConfigSettings.restarts);
-    // saveRestartCount(ConfigSettings.restarts);
   }
 
   if (!loadConfigSerial())
@@ -905,7 +1109,7 @@ void setup(){
     DEBUG_PRINTLN(F("Config serial load OK"));
   }
 
-  if ((!loadConfigWifi()) || (!loadConfigEther()) || (!loadConfigGeneral()) || (!loadConfigSecurity()))
+  if ((!loadConfigWifi()) || (!loadConfigEther()) || (!loadConfigGeneral()) || (!loadConfigSecurity()) || (!loadConfigMqtt()) || (!loadConfigWg()))
   {
     DEBUG_PRINTLN(F("Error load config files"));
     ESP.restart();
@@ -920,8 +1124,31 @@ void setup(){
   setupCoordinatorMode();
   ConfigSettings.connectedClients = 0;
 
-  Serial2.updateBaudRate(ConfigSettings.serialSpeed);//set actual speed
+  if (MqttSettings.enable)
+  {
+    mqttConnectSetup();
+  }
+
+  DEBUG_PRINTLN(millis());
+
+  Serial2.updateBaudRate(ConfigSettings.serialSpeed); // set actual speed
   printLogMsg("Setup done");
+
+  char deviceIdArr[20];
+  getDeviceID(deviceIdArr);
+
+  DEBUG_PRINTLN(String(deviceIdArr));
+  printLogMsg(String(deviceIdArr));
+
+  // Cron.create(const_cast<char *>("0 */1 * * * *"), ledsScheduler, false);
+
+  /*
+  cron_parse_expr(cronstring, &(Alarm[id].expr), &err);
+  if (err) {
+    memset(&(Alarm[id].expr), 0, sizeof(Alarm[id].expr));
+    return dtINVALID_ALARM_ID;
+  }
+  */
 }
 
 WiFiClient client[10];
@@ -937,6 +1164,7 @@ void socketClientConnected(int client)
       ConfigSettings.socketTime = millis();
       DEBUG_PRINT(F("Socket time "));
       DEBUG_PRINTLN(ConfigSettings.socketTime);
+      mqttPublishIo("socket", "ON");
     }
     ConfigSettings.connectedSocket[client] = true;
     ConfigSettings.connectedClients++;
@@ -956,6 +1184,7 @@ void socketClientDisconnected(int client)
       ConfigSettings.socketTime = millis();
       DEBUG_PRINT(F("Socket time "));
       DEBUG_PRINTLN(ConfigSettings.socketTime);
+      mqttPublishIo("socket", "OFF");
     }
   }
 }
@@ -1008,29 +1237,36 @@ void printSendSocket(size_t bytes_read, uint8_t serial_buf[BUFFER_SIZE])
   logPush('-');
   for (int i = 0; i < bytes_read; i++)
   {
-    //if (serial_buf[i] == 0x01)
+    // if (serial_buf[i] == 0x01)
     //{
-    //}
+    // }
     sprintf(output_sprintf, "%02x", serial_buf[i]);
     logPush(' ');
     logPush(output_sprintf[0]);
     logPush(output_sprintf[1]);
-    //if (serial_buf[i] == 0x03)
-   // {
-      
+    // if (serial_buf[i] == 0x03)
+    // {
+
     //}
   }
   logPush('\n');
 }
 
-void loop(void){
-  if(btnFlag){
-    if(!digitalRead(BTN)){//pressed
-      if (tmrBtnLongPress.state() == STOPPED){
-      tmrBtnLongPress.start();
+void loop(void)
+{
+  if (btnFlag)
+  {
+    if (!digitalRead(BTN))
+    { // pressed
+      if (tmrBtnLongPress.state() == STOPPED)
+      {
+        tmrBtnLongPress.start();
+      }
     }
-    }else{
-      if (tmrBtnLongPress.state() == RUNNING){
+    else
+    {
+      if (tmrBtnLongPress.state() == RUNNING)
+      {
         btnFlag = false;
         tmrBtnLongPress.stop();
         toggleUsbMode();
@@ -1040,93 +1276,110 @@ void loop(void){
 
   tmrBtnLongPress.update();
   tmrNetworkOverseer.update();
-  if (updWeb){
+  if (updWeb)
+  {
     webServerHandleClient();
-  }else{
-    if (ConfigSettings.connectedClients == 0){
+  }
+  else
+  {
+    if (ConfigSettings.connectedClients == 0)
+    {
       webServerHandleClient();
     }
   }
 
-  if (ConfigSettings.coordinator_mode != COORDINATOR_MODE_USB){
+  if (ConfigSettings.coordinator_mode != COORDINATOR_MODE_USB)
+  {
     uint16_t net_bytes_read = 0;
     uint8_t net_buf[BUFFER_SIZE];
     uint16_t serial_bytes_read = 0;
     uint8_t serial_buf[BUFFER_SIZE];
 
     if (server.hasClient())
-  {
-    for (byte i = 0; i < MAX_SOCKET_CLIENTS; i++)
     {
-      if (!client[i] || !client[i].connected())
+      for (byte i = 0; i < MAX_SOCKET_CLIENTS; i++)
       {
-        if (client[i])
+        if (!client[i] || !client[i].connected())
         {
-          client[i].stop();
-        }
-        if(ConfigSettings.fwEnabled){
-          WiFiClient TempClient2 = server.available();
-          if(TempClient2.remoteIP() == ConfigSettings.fwIp){
-            printLogMsg(String("[SOCK IP WHITELIST] Accepted connection from IP: ") + TempClient2.remoteIP().toString());
-            client[i] = TempClient2;
-            continue;
-          }else{
-            printLogMsg(String("[SOCK IP WHITELIST] Rejected connection from unknown IP: ") + TempClient2.remoteIP().toString());
+          if (client[i])
+          {
+            client[i].stop();
           }
-        }else{
-          client[i] = server.available();
-          continue;
+          if (ConfigSettings.fwEnabled)
+          {
+            WiFiClient TempClient2 = server.available();
+            if (TempClient2.remoteIP() == ConfigSettings.fwIp)
+            {
+              printLogMsg(String("[SOCK IP WHITELIST] Accepted connection from IP: ") + TempClient2.remoteIP().toString());
+              client[i] = TempClient2;
+              continue;
+            }
+            else
+            {
+              printLogMsg(String("[SOCK IP WHITELIST] Rejected connection from unknown IP: ") + TempClient2.remoteIP().toString());
+            }
+          }
+          else
+          {
+            client[i] = server.available();
+            continue;
+          }
         }
       }
+      WiFiClient TempClient = server.available();
+      TempClient.stop();
     }
-    WiFiClient TempClient = server.available();
-    TempClient.stop();
-  }
 
-  for (byte cln = 0; cln < MAX_SOCKET_CLIENTS; cln++)
-  {
-    if (client[cln])
-    {
-      socketClientConnected(cln);
-      while (client[cln].available())
-      { // read from LAN
-        net_buf[net_bytes_read] = client[cln].read();
-        if (net_bytes_read < BUFFER_SIZE - 1)
-          net_bytes_read++;
-      } // send to Zigbee
-      Serial2.write(net_buf, net_bytes_read);
-      // print to web console
-      printRecvSocket(net_bytes_read, net_buf);
-      net_bytes_read = 0;
-    }
-    else
-    {
-      socketClientDisconnected(cln);
-    }
-  }
-
-  if (Serial2.available())
-  {
-    while (Serial2.available())
-    { // read from Zigbee
-      serial_buf[serial_bytes_read] = Serial2.read();
-      if (serial_bytes_read < BUFFER_SIZE - 1)
-        serial_bytes_read++;
-    }
-    // send to LAN
     for (byte cln = 0; cln < MAX_SOCKET_CLIENTS; cln++)
     {
       if (client[cln])
-        client[cln].write(serial_buf, serial_bytes_read);
+      {
+        socketClientConnected(cln);
+        while (client[cln].available())
+        { // read from LAN
+          net_buf[net_bytes_read] = client[cln].read();
+          if (net_bytes_read < BUFFER_SIZE - 1)
+            net_bytes_read++;
+        } // send to Zigbee
+        Serial2.write(net_buf, net_bytes_read);
+        // print to web console
+        printRecvSocket(net_bytes_read, net_buf);
+        net_bytes_read = 0;
+      }
+      else
+      {
+        socketClientDisconnected(cln);
+      }
     }
-    // print to web console
-    printSendSocket(serial_bytes_read, serial_buf);
-    serial_bytes_read = 0;
-  }
+
+    if (Serial2.available())
+    {
+      while (Serial2.available())
+      { // read from Zigbee
+        serial_buf[serial_bytes_read] = Serial2.read();
+        if (serial_bytes_read < BUFFER_SIZE - 1)
+          serial_bytes_read++;
+      }
+      // send to LAN
+      for (byte cln = 0; cln < MAX_SOCKET_CLIENTS; cln++)
+      {
+        if (client[cln])
+          client[cln].write(serial_buf, serial_bytes_read);
+      }
+      // print to web console
+      printSendSocket(serial_bytes_read, serial_buf);
+      serial_bytes_read = 0;
+    }
+
+    if (MqttSettings.enable)
+    {
+      mqttLoop();
+    }
   }
 
   if (WiFi.getMode() == WIFI_MODE_AP || WiFi.getMode() == WIFI_MODE_APSTA)
   {
     dnsServer.processNextRequest();
   }
+  Cron.delay();
 }
