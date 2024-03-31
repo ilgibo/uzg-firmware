@@ -8,19 +8,19 @@
 // #define DEBUG
 // ESP32 PINS TO CONTROL LAN8720
 #define ETH_CLK_MODE_1 ETH_CLOCK_GPIO17_OUT
-#define ETH_POWER_PIN_ALTERNATIVE_1 5
-#define ETH_POWER_PIN_1 -1
+#define ETH_POWER_PIN_ALTERNATIVE_1 -1
+#define ETH_POWER_PIN_1 5
 #define ETH_TYPE_1 ETH_PHY_LAN8720
 #define ETH_ADDR_1 0
 #define ETH_MDC_PIN_1 23
 #define ETH_MDIO_PIN_1 18
 // ESP32 PINS TO CONTROL CC2652P
 #define CC2652P_RST 16
-#define CC2652P_FLASH 32
-#define CC2652P_RXD 36
-#define CC2652P_TXD 4
-#define BTN 35
-#define MODE_SWITCH 33
+#define CC2652P_FLASH 15
+#define CC2652P_RXD 35
+#define CC2652P_TXD 32
+#define BTN 34
+#define MODE_SWITCH 5
 #define DEBOUNCE_TIME 70
 
 #define TCP_LISTEN_PORT 9999
@@ -32,8 +32,8 @@
 
 const int16_t overseerInterval = 5 * 1000; // check lan or wifi connection every 5sec
 const uint8_t overseerMaxRetry = 3;        // 5x12 = 60sec delay for AP start
-const uint8_t LED_USB = 12;                // RED
-const uint8_t LED_PWR = 14;                // BLUE
+const uint8_t LED_USB = 14;                // RED
+const uint8_t LED_PWR = 33;                // BLUE
 const uint8_t MAX_SOCKET_CLIENTS = 5;
 
 enum COORDINATOR_MODE_t : uint8_t
